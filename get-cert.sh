@@ -16,19 +16,19 @@ else
 fi
 
 REPO_PATH=$(dirname "$(readlink -f "$0")")
-HOOK_DRECTORY="$REPO_PATH/manual_hooks"
+HOOK_DIRECTORY="$REPO_PATH/manual_hooks"
 
 if [ -f "$REPO_PATH/.creds" ]; then
     # Get the credentials from the .creds file
     echo "Reading credentials from $REPO_PATH/.creds"
 
-    DOMAIN=$(grep DOMAIN "$REPO_PATH/.creds" | cut -d '"' -f 2)
-    CONTACT=$(grep CONTACT "$REPO_PATH/.creds" | cut -d '"' -f 2)
-    CLOUD=$(grep CLOUD "$REPO_PATH/.creds" | cut -d '"' -f 2)
-    API_KEY=$(grep API_KEY "$REPO_PATH/.creds" | cut -d '"' -f 2)
-    ZONE_ID=$(grep ZONE_ID "$REPO_PATH/.creds" | cut -d '"' -f 2)
+    DOMAIN=$(grep '^DOMAIN=' "$REPO_PATH/.creds" | cut -d '"' -f 2)
+    CONTACT=$(grep '^CONTACT=' "$REPO_PATH/.creds" | cut -d '"' -f 2)
+    CLOUD=$(grep '^CLOUD=' "$REPO_PATH/.creds" | cut -d '"' -f 2)
+    API_KEY=$(grep '^API_KEY=' "$REPO_PATH/.creds" | cut -d '"' -f 2)
+    ZONE_ID=$(grep '^ZONE_ID=' "$REPO_PATH/.creds" | cut -d '"' -f 2)
 
-    echo "Domain name: $DOMAIN" 
+    echo "Domain name: $DOMAIN"
 fi
 
 if [ -z "$DOMAIN" ]; then
@@ -44,85 +44,83 @@ if [ -z "$CONTACT" ]; then
     read -p "Enter the email [$DEFAULT_EMAIL]: " CONTACT
 fi
 
+# Use the default email if no input provided
+CONTACT="${CONTACT:-$DEFAULT_EMAIL}"
+
 if [ -z "$CLOUD" ]; then
     # Prompt the user to select the cloud provider
     echo "Select the cloud provider:"
     echo "1. Cloudflare"
     echo "2. ArvanCloud"
 
-    mkdir -p "$HOOK_DRECTORY/$DOMAIN"
-
     while true; do
         read -p "Enter your choice (1 or 2): " CLOUD_CHOICE
         case $CLOUD_CHOICE in
-        1)
-            CLOUD="cf"
-
-            # Prompt the API key and zone ID
-            read -p "Enter your Cloudflare API key: " API_KEY
-            read -p "Enter your Cloudflare zone ID: " ZONE_ID
-
-            # Save the API key and zone ID to the creds file
-            echo "API_KEY=\"$API_KEY\"" >"$HOOK_DRECTORY/$DOMAIN/$CLOUD.creds"
-            echo "ZONE_ID=\"$ZONE_ID\"" >>"$HOOK_DRECTORY/$DOMAIN/$CLOUD.creds"
-
-            break
-            ;;
-        2)
-            CLOUD="arvan"
-
-            # Prompt the API key
-            read -p "Enter your ArvanCloud API key: " API_KEY
-
-            # Save the API key to the creds file
-            echo "API_KEY=\"$API_KEY\"" >"$HOOK_DRECTORY/$DOMAIN/$CLOUD.creds"
-
-            break
-            ;;
-        *)
-            echo "Invalid choice. Please enter 1 or 2."
-            ;;
+        1) CLOUD="cf"; break ;;
+        2) CLOUD="arvan"; break ;;
+        *) echo "Invalid choice. Please enter 1 or 2." ;;
         esac
     done
 fi
 
-# Use the default email if no input provided
-CONTACT="${CONTACT:-$DEFAULT_EMAIL}"
+case $CLOUD in
+cf)
+    [ -z "$API_KEY" ] && read -p "Enter your Cloudflare API key: " API_KEY
+    [ -z "$ZONE_ID" ] && read -p "Enter your Cloudflare zone ID: " ZONE_ID
+    ;;
+arvan)
+    [ -z "$API_KEY" ] && read -p "Enter your ArvanCloud API key: " API_KEY
+    ;;
+*)
+    echo "Unknown cloud provider: '$CLOUD' (must be 'cf' or 'arvan')"
+    exit 1
+    ;;
+esac
 
-MANUAL_HOOKS_BASE_URL="https://raw.githubusercontent.com/amirhooshmand/certbot-wildcard/main/manual_hooks"
+# Save the credentials where the hooks expect them.
+# This is done on every run (also when values come from .creds),
+# because the hooks read the API key from this file during issue AND renewal.
+mkdir -p "$HOOK_DIRECTORY/$DOMAIN"
+CREDS_FILE="$HOOK_DIRECTORY/$DOMAIN/$CLOUD.creds"
+(
+    umask 077
+    echo "API_KEY=\"$API_KEY\"" >"$CREDS_FILE"
+    [ "$CLOUD" = "cf" ] && echo "ZONE_ID=\"$ZONE_ID\"" >>"$CREDS_FILE"
+)
 
-download_file() {
-    file_url=$1
-    destination_folder=$2
+MANUAL_HOOKS_BASE_URL="https://raw.githubusercontent.com/amirhoushmand/certbot-wildcard/main/manual_hooks"
 
-    # Extract the filename from the URL
-    filename=$(basename "$file_url")
+# Download a hook only if it isn't already on disk.
+# Set FORCE_DOWNLOAD=1 to fetch the latest version anyway.
+ensure_hook() {
+    filename=$1
+    destination_path="$HOOK_DIRECTORY/$filename"
 
-    # Set the destination path
-    destination_path="$destination_folder/$filename"
-
-    # Download the file using curl
-    curl -o "$destination_path" "$file_url"
-
-    # Check if the download was successful
-    if [ $? -ne 0 ]; then
-        echo "Failed to download the file: $file_url"
+    if [ -s "$destination_path" ] && [ "$FORCE_DOWNLOAD" != "1" ]; then
+        echo "Using existing hook: $destination_path"
     else
-        chmod +x "$destination_path"
+        echo "Downloading hook: $filename"
+        # -f: fail on HTTP errors instead of saving a 404 page as the hook
+        if ! curl -fsSL -o "$destination_path.tmp" "$MANUAL_HOOKS_BASE_URL/$filename"; then
+            rm -f "$destination_path.tmp"
+            echo "Failed to download the file: $MANUAL_HOOKS_BASE_URL/$filename"
+            exit 1
+        fi
+        mv "$destination_path.tmp" "$destination_path"
     fi
+
+    chmod +x "$destination_path"
 }
 
-auth_url="$MANUAL_HOOKS_BASE_URL/$CLOUD.auth.sh"
-clean_url="$MANUAL_HOOKS_BASE_URL/$CLOUD.clean.sh"
+ensure_hook "$CLOUD.auth.sh"
+ensure_hook "$CLOUD.clean.sh"
 
-mkdir -p $HOOK_DRECTORY
-download_file "$auth_url" "$HOOK_DRECTORY"
-download_file "$clean_url" "$HOOK_DRECTORY"
-
+# Note: the hooks and creds are intentionally NOT deleted afterwards.
+# certbot stores these hook paths in /etc/letsencrypt/renewal/$DOMAIN.conf
+# and runs them again on every "certbot renew".
 certbot certonly -n --agree-tos --manual \
+    --keep-until-expiring \
     --no-eff-email --preferred-challenges=dns \
-    --manual-auth-hook "$HOOK_DRECTORY"/$CLOUD.auth.sh \
-    --manual-cleanup-hook "$HOOK_DRECTORY"/$CLOUD.clean.sh \
-    -m "$CONTACT" -d "$DOMAIN",*."$DOMAIN"
-
-rm -r "$HOOK_DRECTORY"
+    --manual-auth-hook "$HOOK_DIRECTORY/$CLOUD.auth.sh" \
+    --manual-cleanup-hook "$HOOK_DIRECTORY/$CLOUD.clean.sh" \
+    -m "$CONTACT" -d "$DOMAIN,*.$DOMAIN"
